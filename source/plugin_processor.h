@@ -1,86 +1,85 @@
+// plugin_processor.h — ÁCIDO plugin shell (phase 6)
 #pragma once
-#include <juce_audio_utils/juce_audio_utils.h>
-#include "engine.h"
 
-class RaspaProcessor : public juce::AudioProcessor,
-                       private juce::AudioProcessorValueTreeState::Listener
+#include <juce_audio_utils/juce_audio_utils.h>
+#include "dsp/acid_engine.h"
+#include "dsp/step_mod.h"
+#include "preset_manager.h"
+#include <map>
+#include <string>
+
+class AcidoProcessor : public juce::AudioProcessor
 {
 public:
-    RaspaProcessor();
-    ~RaspaProcessor() override;
+    AcidoProcessor();
+    ~AcidoProcessor() override = default;
 
+    // Audio
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+    using AudioProcessor::processBlock;
 
+    // Editor (a working test window for now; the designed interface comes in phase 6)
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
 
-    const juce::String getName() const override { return "raspa"; }
-    bool acceptsMidi() const override { return true; }
-    bool producesMidi() const override { return true; }
+    // Info
+    const juce::String getName() const override { return JucePlugin_Name; }
+    bool acceptsMidi() const override  { return true; }
+    bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 8.0; }
+    double getTailLengthSeconds() const override { return 12.0; }   // reverb and delay tails
 
+    // Programs (presets come in phase 5)
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
     void setCurrentProgram (int) override {}
-    const juce::String getProgramName (int) override { return {}; }
+    const juce::String getProgramName (int) override { return "Squelch Init"; }
     void changeProgramName (int, const juce::String&) override {}
 
+    // State saved inside the Live Set
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
-    static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
-    static juce::String pid (const char* name, int lane) { return juce::String (name) + "_" + juce::String (lane + 1); }
-
     juce::AudioProcessorValueTreeState apvts;
-    raspa::Engine engine;
-    // generator: roll a new variation for one lane (or all with lane = -1); ignored when locked
-    void roll (int lane);
-    bool isLocked (int lane) const { return lp[lane].lock->load() > 0.5f; }
-    std::atomic<uint32_t> seed[raspa::numLanes];
 
-    // presets: factory first, then the user's own (Documents/raspa/presets)
-    juce::StringArray getPresetNames();
-    int numFactory() const;
-    void loadPreset (int index);
-    void stepPreset (int delta);
-    bool saveUserPreset (const juce::String& name);
-    juce::String currentPresetName { "Init" };
-    int currentPreset = -1;
-    static juce::File userPresetFolder();
+    // Step modulator: one lane per knob listed in modTargets(), same order.
+    static const std::vector<std::string>& modTargets();
+    std::vector<std::unique_ptr<acido::Lane>> lanes;
+    int laneIndexFor (const std::string& id) const;
+    void resetLanes() { loadLanes ({}); }
 
-    static juce::String noteName (int note);
+    // The whole sound (knobs + lanes + preset name), for the Live Set and preset files.
+    juce::ValueTree makeState();
+    bool applyState (juce::ValueTree state);
 
-    // MIDI learn for the launch notes: set learnLane, the next note-on is captured for it
-    std::atomic<int> learnLane { -1 };
-    std::atomic<int> learned[raspa::numLanes] { { -1 }, { -1 }, { -1 }, { -1 } };
+    PresetManager presets { *this };
 
+    // For the window: Ableton's tempo and play state, and the window size.
     std::atomic<double> hostBpm { 120.0 };
     std::atomic<bool> hostPlaying { false };
+    float uiScale = 0.75f;
 
 private:
-    struct LaneParams { std::atomic<float>* voice; std::atomic<float>* latch; std::atomic<float>* grain; std::atomic<float>* seed; std::atomic<float>* decay; std::atomic<float>* level; std::atomic<float>* pitch;
-                        std::atomic<float>* genre; std::atomic<float>* density; std::atomic<float>* variation; std::atomic<float>* swing;
-                        std::atomic<float>* accent; std::atomic<float>* humanize; std::atomic<float>* lock;
-                        std::atomic<float>* pan; std::atomic<float>* hipass; std::atomic<float>* cutoff; std::atomic<float>* res; std::atomic<float>* send[4]; std::atomic<float>* dtime; };
-    std::atomic<float>* g[18] = {};
-    std::atomic<float>* outNote[raspa::numLanes] = {};
-    std::atomic<float>* inNote[raspa::numLanes] = {};
-    void applyStepString (const juce::String& key, const juce::String& digits);
-    std::atomic<float>* midiOutOn = nullptr;
-    std::atomic<float>* midiOutCh = nullptr;
-    int sounding[raspa::numLanes] = { -1, -1, -1, -1 };   // note each lane has on (MIDI out), -1 none
-    int soundingCh = 10;
-    juce::Array<juce::File> userFiles;
-    void parameterChanged (const juce::String& id, float newValue) override;
-    void regenerate (int lane);
-    std::atomic<bool> loadingState { false };
-    LaneParams lp[raspa::numLanes];
-    std::vector<raspa::NoteEvent> events;
-    juce::AudioBuffer<float> scratch;
+    static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
+    acido::SoundParams readParams();
+    float value (const char* id);   // knob value plus its step lane, in real units
+    void handleMidi (const juce::MidiMessage& m);
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (RaspaProcessor)
+    acido::AcidEngine engine;
+    std::vector<float> left, right;   // stereo render buffers
+
+    // Fast pointers to the current parameter values, by ID.
+    std::map<std::string, std::atomic<float>*> params;
+    std::map<std::string, juce::RangedAudioParameter*> ranged;
+    std::map<std::string, int> laneOf;
+    acido::StepModulator modulator;
+    double currentSampleRate = 44100.0;
+
+    void saveLanes (juce::ValueTree& state) const;
+    void loadLanes (const juce::ValueTree& state);
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AcidoProcessor)
 };

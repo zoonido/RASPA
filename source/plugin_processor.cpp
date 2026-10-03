@@ -1,418 +1,378 @@
+// plugin_processor.cpp — ÁCIDO plugin shell (phase 6)
 #include "plugin_processor.h"
 #include "plugin_editor.h"
-#include "defaults.h"
-#include "generator.h"
-#include "presets.h"
 
-using namespace raspa;
 
-RaspaProcessor::RaspaProcessor()
+namespace
+{
+    // A range that spends more of the knob's travel on the low end (for Hz / ms).
+    juce::NormalisableRange<float> logRange (float lo, float hi, float centre)
+    {
+        juce::NormalisableRange<float> r (lo, hi);
+        r.setSkewForCentre (centre);
+        return r;
+    }
+
+    // Readable values: "420 Hz", "82%", "60 ms", "-3 dB", "0.5 st".
+    juce::AudioParameterFloatAttributes unit (const juce::String& label)
+    {
+        return juce::AudioParameterFloatAttributes()
+            .withLabel (label)
+            .withStringFromValueFunction ([label] (float v, int)
+            {
+                if (label == "%" || std::abs (v) >= 100.0f) return juce::String (juce::roundToInt (v));
+                const auto oneDecimal = juce::String (v, 1);
+                return oneDecimal.endsWith (".0") ? oneDecimal.dropLastCharacters (2) : oneDecimal;
+            });
+    }
+}
+
+// Parameter order matters: Ableton and Push 1 show them in this order, so the
+// first eight are the core acid controls (spec: Behaviour rules > General).
+juce::AudioProcessorValueTreeState::ParameterLayout AcidoProcessor::createLayout()
+{
+    using P = juce::AudioParameterFloat;
+    using C = juce::AudioParameterChoice;
+    std::vector<std::unique_ptr<juce::RangedAudioParameter>> ps;
+
+    auto pct = [&ps] (const char* id, const char* name, float def)
+    {
+        ps.push_back (std::make_unique<P> (juce::ParameterID { id, 1 }, name,
+                                           juce::NormalisableRange<float> (0.0f, 100.0f), def, unit ("%")));
+    };
+
+    // Bank 1 — core acid controls
+    ps.push_back (std::make_unique<P> (juce::ParameterID { "cutoff", 1 }, "Cutoff",
+                                       logRange (20.0f, 18000.0f, 800.0f), 420.0f, unit ("Hz")));
+    pct ("reso",   "Resonance", 82.0f);
+    pct ("envmod", "Env Mod",   60.0f);
+    ps.push_back (std::make_unique<P> (juce::ParameterID { "decay", 1 }, "Decay",
+                                       logRange (30.0f, 3000.0f, 300.0f), 340.0f, unit ("ms")));
+    pct ("accent", "Accent",    70.0f);
+    ps.push_back (std::make_unique<P> (juce::ParameterID { "slide", 1 }, "Slide",
+                                       logRange (10.0f, 1000.0f, 100.0f), 60.0f, unit ("ms")));
+    pct ("drive",  "Drive",     30.0f);
+    ps.push_back (std::make_unique<P> (juce::ParameterID { "vol", 1 }, "Volume",
+                                       juce::NormalisableRange<float> (-60.0f, 6.0f), -3.0f, unit ("dB")));
+
+    // Bank 2 — oscillator
+    ps.push_back (std::make_unique<C> (juce::ParameterID { "wave", 1 }, "Waveform",
+                                       juce::StringArray { "Saw", "Square", "Sine", "FM" }, 0));
+    ps.push_back (std::make_unique<P> (juce::ParameterID { "tune", 1 }, "Tune",
+                                       juce::NormalisableRange<float> (-24.0f, 24.0f), 0.0f, unit ("st")));
+    pct ("shape",  "Shape",     20.0f);
+    pct ("sub",    "Sub",       40.0f);
+    ps.push_back (std::make_unique<C> (juce::ParameterID { "suboct", 1 }, "Sub Octave",
+                                       juce::StringArray { "-1 oct", "-2 oct" }, 0));
+    pct ("ffm",    "Filter FM",  0.0f);
+    pct ("noise",  "Noise",      0.0f);
+    pct ("warmth", "Warmth",    45.0f);
+
+    // Bank 3 — feel, chorus and delay
+    pct ("drift",  "Drift",     20.0f);
+    pct ("velo",   "Velo",      50.0f);
+    pct ("cmix",   "Chorus Dry/Wet", 0.0f);
+    pct ("ctone",  "Chorus Tone",   60.0f);
+    pct ("dmix",   "Delay Dry/Wet", 20.0f);
+    ps.push_back (std::make_unique<P> (juce::ParameterID { "dfb", 1 }, "Delay Feedback",
+                                       juce::NormalisableRange<float> (0.0f, 95.0f), 45.0f, unit ("%")));
+    ps.push_back (std::make_unique<C> (juce::ParameterID { "ddiv", 1 }, "Delay Time (Sync)",
+                                       juce::StringArray { "1/32", "1/16 T", "1/16", "1/16 D", "1/8 T", "1/8",
+                                                           "1/8 D", "1/4 T", "1/4", "1/4 D", "1/2", "1 bar" }, 6));
+    ps.push_back (std::make_unique<C> (juce::ParameterID { "dsync", 1 }, "Delay Sync / MS",
+                                       juce::StringArray { "Sync", "MS" }, 0));
+
+    // Bank 4 — reverb and output
+    pct ("rmix",   "Reverb Send",    15.0f);
+    pct ("rsize",  "Reverb Size",    62.0f);
+    ps.push_back (std::make_unique<C> (juce::ParameterID { "rtype", 1 }, "Reverb Type",
+                                       juce::StringArray { "Room", "Hall", "Plate", "Spring" }, 2));
+    pct ("crush",  "Crush",           0.0f);
+    pct ("comp",   "Comp",           35.0f);
+    ps.push_back (std::make_unique<P> (juce::ParameterID { "dms", 1 }, "Delay Time (MS)",
+                                       logRange (1.0f, 2000.0f, 250.0f), 375.0f, unit ("ms")));
+    pct ("neblina", "Neblina",        0.0f);
+    ps.push_back (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { "unison", 1 }, "Unison", 1, 7, 1));
+
+    // Bank 5 — voices
+    ps.push_back (std::make_unique<C> (juce::ParameterID { "mode", 1 }, "Mono / Poly",
+                                       juce::StringArray { "Mono", "Poly" }, 0));
+    ps.push_back (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { "voices", 1 }, "Poly Voices", 2, 8, 6));
+
+    return { ps.begin(), ps.end() };
+}
+
+AcidoProcessor::AcidoProcessor()
     : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
-      apvts (*this, nullptr, "RASPA", createLayout())
+      apvts (*this, nullptr, "ACIDO", createLayout())
 {
-    for (int i = 0; i < numLanes; ++i)
+    for (auto* id : { "cutoff", "reso", "envmod", "decay", "accent", "slide", "drive", "vol",
+                      "wave", "tune", "shape", "sub", "suboct", "ffm", "noise", "warmth", "drift", "velo",
+                      "cmix", "ctone", "dmix", "dfb", "ddiv", "dsync", "rmix", "rsize", "rtype", "crush", "comp", "dms",
+                      "neblina", "unison", "mode", "voices" })
+        params[id] = apvts.getRawParameterValue (id);
+
+    for (auto* p : getParameters())
+        if (auto* r = dynamic_cast<juce::RangedAudioParameter*> (p))
+            ranged[r->getParameterID().toStdString()] = r;
+
+    for (const auto& id : modTargets())
     {
-        auto raw = [&] (const char* n) { return apvts.getRawParameterValue (pid (n, i)); };
-        lp[i] = { raw ("voice"), raw ("latch"), raw ("grain"), raw ("seed"), raw ("decay"), raw ("level"), raw ("pitch"),
-                  raw ("genre"), raw ("density"), raw ("variation"), raw ("swing"), raw ("accent"), raw ("humanize"), raw ("lock"),
-                  raw ("pan"), raw ("hipass"), raw ("cutoff"), raw ("res"), { raw ("sendA"), raw ("sendB"), raw ("sendC"), raw ("sendD") }, raw ("dtime") };
-        seed[i].store (1);
-        regenerate (i);
-        for (auto* n : { "voice", "genre", "density", "variation" })
-            apvts.addParameterListener (pid (n, i), this);
+        laneOf[id] = (int) lanes.size();
+        lanes.push_back (std::make_unique<acido::Lane>());
     }
-    static const char* globals[18] = { "verb_size", "verb_decay", "verb_damp", "verb_pre", "verb_return",
-                                       "dly_feedback", "dly_cutoff", "dly_res", "dly_return",
-                                       "cho_rate", "cho_depth", "cho_width", "cho_return",
-                                       "rev_length", "rev_slice", "rev_fade", "rev_return", "master" };
-    for (int k = 0; k < 18; ++k) g[k] = apvts.getRawParameterValue (globals[k]);
-    for (int i = 0; i < numLanes; ++i) outNote[i] = apvts.getRawParameterValue (pid ("outnote", i));
-    for (int i = 0; i < numLanes; ++i) inNote[i] = apvts.getRawParameterValue (pid ("innote", i));
-    midiOutOn = apvts.getRawParameterValue ("midiout_on");
-    midiOutCh = apvts.getRawParameterValue ("midiout_ch");
-    events.reserve (1024);
+
+    presets.refresh();
+    presets.load (0);   // Squelch Init
 }
 
-RaspaProcessor::~RaspaProcessor()
+// Knobs that can take a step lane (spec: Parameters table, "Step mod: Yes").
+const std::vector<std::string>& AcidoProcessor::modTargets()
 {
-    for (int i = 0; i < numLanes; ++i)
-        for (auto* n : { "voice", "genre", "density", "variation" })
-            apvts.removeParameterListener (pid (n, i), this);
+    static const std::vector<std::string> ids {
+        "cutoff", "reso", "envmod", "decay", "accent", "slide", "drive", "vol",
+        "tune", "shape", "sub", "ffm", "noise", "warmth", "drift", "velo",
+        "cmix", "ctone", "dmix", "dfb", "rmix", "rsize", "crush", "comp", "neblina" };
+    return ids;
 }
 
-void RaspaProcessor::parameterChanged (const juce::String& id, float)
+int AcidoProcessor::laneIndexFor (const std::string& id) const
 {
-    if (loadingState.load()) return;          // a loaded set keeps its saved patterns
-    int lane = id.getTrailingIntValue() - 1;
-    if (lane >= 0 && lane < numLanes) regenerate (lane);
+    const auto it = laneOf.find (id);
+    return it == laneOf.end() ? -1 : it->second;
 }
 
-void RaspaProcessor::regenerate (int lane)
+float AcidoProcessor::value (const char* id)
 {
-    if (isLocked (lane)) return;
-    int p[numSteps];
-    raspa::generatePattern ((int) lp[lane].voice->load(), (int) lp[lane].genre->load(),
-                            lp[lane].density->load(), lp[lane].variation->load(), seed[lane].load(), p);
-    for (int s = 0; s < numSteps; ++s) engine.lanes[lane].pattern[s].store (p[s]);
+    const float raw = params.at (id)->load();
+    const auto lane = laneOf.find (id);
+    if (lane == laneOf.end()) return raw;
+
+    const float offset = modulator.offset ((size_t) lane->second);
+    if (std::abs (offset) < 1e-7f) return raw;
+
+    auto* p = ranged.at (id);
+    return p->convertFrom0to1 (acido::applyOffset (p->convertTo0to1 (raw), offset));
 }
 
-void RaspaProcessor::roll (int lane)
+juce::AudioProcessorEditor* AcidoProcessor::createEditor() { return new AcidoEditor (*this); }
+
+bool AcidoProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-    for (int i = 0; i < numLanes; ++i)
-        if ((lane < 0 || lane == i) && ! isLocked (i))
-        {
-            seed[i].store ((uint32_t) juce::Random::getSystemRandom().nextInt (1 << 30) + 2u);
-            regenerate (i);
-        }
-}
-
-juce::AudioProcessorValueTreeState::ParameterLayout RaspaProcessor::createLayout()
-{
-    juce::AudioProcessorValueTreeState::ParameterLayout layout;
-    for (int i = 0; i < numLanes; ++i)
-    {
-        auto lane = " " + juce::String (i + 1);
-        const auto& d = laneDefaults[i];
-        juce::StringArray voices;
-        for (int t = 0; t < numVoiceTypes; ++t) voices.add (juce::String::fromUTF8 (voiceName (t)));
-        layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { pid ("voice", i), 2 }, "Voice" + lane, voices, d.voice));
-        layout.add (std::make_unique<juce::AudioParameterBool>  (juce::ParameterID { pid ("latch", i), 1 }, "Latch" + lane, false));
-        // ids stay "grain"/"seed" so stage-1 sets still load; they are the two voice knobs
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("grain", i), 1 }, "Voice A" + lane, 0.0f, 1.0f, d.a));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("seed",  i), 1 }, "Voice B" + lane, 0.0f, 1.0f, d.b));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("decay", i), 1 }, "Decay" + lane, 0.0f, 1.0f, d.decay));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("level", i), 1 }, "Level" + lane, 0.0f, 1.0f, d.level));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("pitch", i), 4 }, "Pitch" + lane,
-                        juce::NormalisableRange<float> (-12.0f, 12.0f), 0.0f,
-                        juce::AudioParameterFloatAttributes().withLabel ("st")
-                            .withStringFromValueFunction ([] (float v, int) { return (v > 0.004f ? "+" : "") + juce::String (v, 2) + " st"; })));
-        juce::StringArray genres;
-        for (int g = 0; g < numGenres; ++g) genres.add (genreName (g));
-        layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { pid ("genre", i), 3 }, "Genre" + lane, genres, d.genre));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("density", i), 3 },   "Density" + lane,   0.0f, 1.0f, d.density));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("variation", i), 3 }, "Variation" + lane, 0.0f, 1.0f, d.variation));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("swing", i), 3 },     "Swing" + lane,     0.0f, 1.0f, d.swing));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("accent", i), 3 },    "Accent" + lane,    0.0f, 1.0f, d.accent));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("humanize", i), 3 },  "Humanize" + lane,  0.0f, 1.0f, d.humanize));
-        layout.add (std::make_unique<juce::AudioParameterBool>  (juce::ParameterID { pid ("lock", i), 3 },      "Lock" + lane, false));
-
-        const auto& m = laneMix[i];
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("pan", i), 5 },    "Pan" + lane,    -1.0f, 1.0f, m.pan));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("cutoff", i), 5 }, "Cutoff" + lane, 0.0f, 1.0f, 1.0f));
-        layout.add (std::make_unique<juce::AudioParameterBool>  (juce::ParameterID { pid ("hipass", i), 8 }, "Filter high-pass" + lane, false));
-        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid ("res", i), 5 },    "Resonance" + lane, 0.0f, 1.0f, 0.0f));
-        const char* sendNames[4] = { "Reverb send", "Delay send", "Chorus send", "Reverse send" };
-        const char* sendIds[4] = { "sendA", "sendB", "sendC", "sendD" };
-        for (int k = 0; k < 4; ++k)
-            layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { pid (sendIds[k], i), 5 }, sendNames[k] + lane, 0.0f, 1.0f, m.send[k]));
-        juce::StringArray times;
-        for (int d = 0; d < numDelayTimes; ++d) times.add (delayTimeName (d));
-        layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { pid ("dtime", i), 5 }, "Delay time" + lane, times, m.delayTime));
-        layout.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { pid ("innote", i), 7 }, "MIDI in note" + lane, 0, 127, firstNote + i,
-                        juce::AudioParameterIntAttributes().withStringFromValueFunction ([] (int v, int) { return noteName (v); })));
-        layout.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { pid ("outnote", i), 6 }, "MIDI out note" + lane, 0, 127, firstNote + i,
-                        juce::AudioParameterIntAttributes().withStringFromValueFunction ([] (int v, int) { return noteName (v); })));
-    }
-    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "midiout_on", 6 }, "MIDI out", true));
-    layout.add (std::make_unique<juce::AudioParameterInt>  (juce::ParameterID { "midiout_ch", 6 }, "MIDI out channel", 1, 16, 10));
-
-    auto f = [&] (const char* id, const char* name, float def)
-    { layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { id, 5 }, name, 0.0f, 1.0f, def)); };
-    const raspa::FxSettings d;
-    f ("verb_size", "Reverb size", d.verbSize);       f ("verb_decay", "Reverb decay", d.verbDecay);
-    f ("verb_damp", "Reverb damp", d.verbDamp);       f ("verb_pre", "Reverb pre-delay", d.verbPre);
-    f ("verb_return", "Reverb return", d.verbReturn);
-    f ("dly_feedback", "Delay feedback", d.dlyFeedback); f ("dly_cutoff", "Delay cutoff", d.dlyCutoff);
-    f ("dly_res", "Delay resonance", d.dlyRes);       f ("dly_return", "Delay return", d.dlyReturn);
-    f ("cho_rate", "Chorus rate", d.choRate);         f ("cho_depth", "Chorus depth", d.choDepth);
-    f ("cho_width", "Chorus width", d.choWidth);      f ("cho_return", "Chorus return", d.choReturn);
-    juce::StringArray lens;
-    for (int r = 0; r < numReverseLengths; ++r) lens.add (reverseLengthName (r));
-    layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "rev_length", 5 }, "Reverse length", lens, d.revLength));
-    f ("rev_slice", "Reverse slice", d.revSlice);     f ("rev_fade", "Reverse fade", d.revFade);
-    f ("rev_return", "Reverse return", d.revReturn);
-    f ("master", "Master volume", d.master);
-    return layout;
-}
-
-void RaspaProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
-{
-    engine.prepare (sampleRate);
-    scratch.setSize (2, juce::jmax (samplesPerBlock, 32));
-}
-
-bool RaspaProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
-{
-    auto out = layouts.getMainOutputChannelSet();
+    const auto out = layouts.getMainOutputChannelSet();
     return out == juce::AudioChannelSet::stereo() || out == juce::AudioChannelSet::mono();
 }
 
-void RaspaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
+void AcidoProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    juce::ScopedNoDenormals noDenormals;
-    const int n = buffer.getNumSamples();
-
-    Transport t;
-    if (auto* ph = getPlayHead())
-        if (auto pos = ph->getPosition())
-        {
-            if (auto bpm = pos->getBpm()) t.bpm = *bpm;
-            t.playing = pos->getIsPlaying();
-            if (auto ppq = pos->getPpqPosition()) t.ppq = *ppq; else t.playing = false;
-        }
-    hostBpm.store (t.bpm);
-    hostPlaying.store (t.playing);
-
-    for (int i = 0; i < numLanes; ++i)
-    {
-        auto& l = engine.lanes[i];
-        l.latch = lp[i].latch->load() > 0.5f;
-        l.level = lp[i].level->load();
-        l.swing = lp[i].swing->load();
-        l.accent = lp[i].accent->load();
-        l.humanize = lp[i].humanize->load();
-        l.pan = lp[i].pan->load();
-        l.cutoff = lp[i].cutoff->load();
-        l.highpass = lp[i].hipass->load() > 0.5f;
-        l.res = lp[i].res->load();
-        for (int k = 0; k < 4; ++k) l.send[k] = lp[i].send[k]->load();
-        l.delayTime = (int) lp[i].dtime->load();
-        l.inNote = (int) inNote[i]->load();
-        l.voice.setParams ((int) lp[i].voice->load(), lp[i].grain->load(), lp[i].seed->load(), lp[i].decay->load(), lp[i].pitch->load());
-    }
-
-    auto& fx = engine.fx;
-    fx.verbSize = g[0]->load(); fx.verbDecay = g[1]->load(); fx.verbDamp = g[2]->load(); fx.verbPre = g[3]->load(); fx.verbReturn = g[4]->load();
-    fx.dlyFeedback = g[5]->load(); fx.dlyCutoff = g[6]->load(); fx.dlyRes = g[7]->load(); fx.dlyReturn = g[8]->load();
-    fx.choRate = g[9]->load(); fx.choDepth = g[10]->load(); fx.choWidth = g[11]->load(); fx.choReturn = g[12]->load();
-    fx.revLength = (int) g[13]->load(); fx.revSlice = g[14]->load(); fx.revFade = g[15]->load(); fx.revReturn = g[16]->load();
-    fx.master = g[17]->load();
-
-    events.clear();
-    for (const auto meta : midi)
-    {
-        const auto m = meta.getMessage();
-        if (m.isNoteOn() && learnLane.load() >= 0)
-        {
-            const int lane = learnLane.exchange (-1);      // MIDI learn: this note becomes the lane's launch note
-            if (lane >= 0 && lane < numLanes) learned[lane].store (m.getNoteNumber());
-        }
-        else if (m.isNoteOn())
-            events.push_back ({ meta.samplePosition, m.getNoteNumber(), true });
-        else if (m.isNoteOff())
-            events.push_back ({ meta.samplePosition, m.getNoteNumber(), false });
-        else if (m.isAllNotesOff() || m.isAllSoundOff())
-            for (int i = 0; i < numLanes; ++i)
-                for (int k = 0; k < 8; ++k)
-                    events.push_back ({ meta.samplePosition, engine.lanes[i].inNote, false });
-        if (events.size() >= events.capacity() - 40) break;
-    }
-    midi.clear();   // incoming notes are used up; what goes out is RASPA's own hits
-
-    if (scratch.getNumSamples() < n) scratch.setSize (2, n, false, false, true);
-    const bool outOn = midiOutOn->load() > 0.5f;
-    const int ch = juce::jlimit (1, 16, (int) midiOutCh->load());
-    if (! outOn || ch != soundingCh)
-        for (int i = 0; i < numLanes; ++i)                       // switched off / channel changed: close open notes
-            if (sounding[i] >= 0) { midi.addEvent (juce::MidiMessage::noteOff (soundingCh, sounding[i]), 0); sounding[i] = -1; }
-    soundingCh = ch;
-    engine.midiOutEnabled = outOn;
-    engine.process (scratch.getWritePointer (0), scratch.getWritePointer (1), n, t, events);
-
-    for (const auto& m : engine.midiOut)
-    {
-        if (m.on)
-        {
-            const int note = juce::jlimit (0, 127, (int) outNote[m.lane]->load());
-            const auto vel = (juce::uint8) juce::jlimit (1, 127, (int) std::lround (m.velocity * 127.0f));
-            midi.addEvent (juce::MidiMessage::noteOn (ch, note, vel), m.sample);
-            sounding[m.lane] = note;
-        }
-        else if (sounding[m.lane] >= 0)
-        {
-            midi.addEvent (juce::MidiMessage::noteOff (ch, sounding[m.lane]), m.sample);   // the note that was actually sent
-            sounding[m.lane] = -1;
-        }
-    }
-
-    const int chans = buffer.getNumChannels();
-    if (chans == 1)
-    {
-        buffer.copyFrom (0, 0, scratch, 0, 0, n);
-        buffer.addFrom (0, 0, scratch, 1, 0, n);
-        buffer.applyGain (0.5f);
-    }
-    else
-        for (int c = 0; c < chans; ++c)
-            buffer.copyFrom (c, 0, scratch, juce::jmin (c, 1), 0, n);
+    currentSampleRate = sampleRate;
+    engine.prepare (sampleRate);
+    modulator.prepare (sampleRate, lanes.size());
+    left.assign  ((size_t) juce::jmax (1, samplesPerBlock), 0.0f);
+    right.assign ((size_t) juce::jmax (1, samplesPerBlock), 0.0f);
 }
 
-void RaspaProcessor::getStateInformation (juce::MemoryBlock& destData)
+acido::SoundParams AcidoProcessor::readParams()
+{
+    acido::SoundParams p;
+    auto& v = p.voice;
+    v.cutoffHz = value ("cutoff");
+    v.reso     = value ("reso")   * 0.01f;
+    v.envMod   = value ("envmod") * 0.01f;
+    v.decayMs  = value ("decay");
+    v.accent   = value ("accent") * 0.01f;
+    v.slideMs  = value ("slide");
+    v.wave     = (int) value ("wave");
+    v.tune     = value ("tune");
+    v.shape    = value ("shape")  * 0.01f;
+    v.subLevel = value ("sub")    * 0.01f;
+    v.subOct   = (int) value ("suboct") + 1;
+    v.filterFm = value ("ffm")    * 0.01f;
+    v.noise    = value ("noise")  * 0.01f;
+    v.drift    = value ("drift")  * 0.01f;
+    v.velo     = value ("velo")   * 0.01f;
+    p.drive    = value ("drive")  * 0.01f;
+    p.warmth   = value ("warmth") * 0.01f;
+    p.volumeDb = value ("vol");
+    p.chorusMix  = value ("cmix")  * 0.01f;
+    p.chorusTone = value ("ctone") * 0.01f;
+    p.delayMix   = value ("dmix")  * 0.01f;
+    p.delayFb    = value ("dfb")   * 0.01f;
+    p.delayDiv   = (int) value ("ddiv");
+    p.delaySync  = (int) value ("dsync") == 0;
+    p.delayMs    = value ("dms");
+    p.reverbMix  = value ("rmix")  * 0.01f;
+    p.reverbSize = value ("rsize") * 0.01f;
+    p.reverbType = (int) value ("rtype");
+    p.crush      = value ("crush") * 0.01f;
+    p.comp       = value ("comp")  * 0.01f;
+    v.neblina    = value ("neblina") * 0.01f;
+    v.unison     = (int) value ("unison");
+    p.poly       = (int) value ("mode") == 1;
+    p.voices     = (int) value ("voices");
+
+    return p;
+}
+
+void AcidoProcessor::handleMidi (const juce::MidiMessage& m)
+{
+    if (m.isNoteOn())                                   engine.noteOn (m.getNoteNumber(), m.getVelocity());
+    else if (m.isNoteOff())                             engine.noteOff (m.getNoteNumber());
+    else if (m.isAllNotesOff() || m.isAllSoundOff())    engine.allNotesOff();
+}
+
+void AcidoProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
+{
+    juce::ScopedNoDenormals noDenormals;
+
+    const int numSamples = buffer.getNumSamples();
+    if ((int) left.size() < numSamples)   // safety for hosts that send bigger blocks
+    {
+        left.resize ((size_t) numSamples);
+        right.resize ((size_t) numSamples);
+    }
+
+    // Ableton's tempo, play state and song position.
+    double bpm = 120.0, ppqStart = 0.0;
+    bool playing = false;
+    if (auto* host = getPlayHead())
+        if (auto position = host->getPosition())
+        {
+            if (auto b = position->getBpm()) if (*b > 1.0) bpm = *b;
+            if (auto q = position->getPpqPosition()) ppqStart = *q;
+            playing = position->getIsPlaying();
+        }
+    const double beatsPerSample = bpm / 60.0 / currentSampleRate;
+    hostBpm = bpm;
+    hostPlaying = playing;
+
+    // Apply Mono/Poly before this block's notes arrive, so no note goes to the wrong mode.
+    engine.setMode ((int) params.at ("mode")->load() == 1, (int) params.at ("voices")->load());
+
+    // Render in small chunks (at most 32 samples) so step lanes stay tight,
+    // splitting at MIDI events so every note starts on its exact sample.
+    constexpr int kChunk = 32;
+    auto renderSpan = [&] (int from, int to)
+    {
+        for (int pos = from; pos < to;)
+        {
+            const int len = juce::jmin (kChunk, to - pos);
+            modulator.process (lanes, playing, ppqStart + pos * beatsPerSample, len);
+            auto p = readParams();
+            p.bpm = bpm;
+            engine.render (left.data() + pos, right.data() + pos, len, p);
+            pos += len;
+        }
+    };
+
+    int pos = 0;
+    for (const auto meta : midi)
+    {
+        const int eventPos = juce::jlimit (0, numSamples, meta.samplePosition);
+        if (eventPos > pos) { renderSpan (pos, eventPos); pos = eventPos; }
+        handleMidi (meta.getMessage());
+    }
+    if (pos < numSamples) renderSpan (pos, numSamples);
+
+    if (buffer.getNumChannels() >= 2)
+    {
+        buffer.copyFrom (0, 0, left.data(), numSamples);
+        buffer.copyFrom (1, 0, right.data(), numSamples);
+        for (int ch = 2; ch < buffer.getNumChannels(); ++ch) buffer.clear (ch, 0, numSamples);
+    }
+    else if (buffer.getNumChannels() == 1)
+    {
+        buffer.copyFrom (0, 0, left.data(), numSamples, 0.5f);
+        buffer.addFrom  (0, 0, right.data(), numSamples, 0.5f);
+    }
+}
+
+// Lanes are saved next to the knob values, inside the Live Set.
+void AcidoProcessor::saveLanes (juce::ValueTree& state) const
+{
+    juce::ValueTree all ("LANES");
+    const auto& ids = modTargets();
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        const auto& lane = *lanes[i];
+        juce::StringArray values;
+        for (auto& v : lane.steps) values.add (juce::String (v.load(), 4));
+        juce::ValueTree t ("LANE");
+        t.setProperty ("id", juce::String (ids[i]), nullptr);
+        t.setProperty ("steps", values.joinIntoString (","), nullptr);
+        t.setProperty ("length", lane.length.load(), nullptr);
+        t.setProperty ("rate", lane.rate.load(), nullptr);
+        t.setProperty ("smooth", lane.smooth.load(), nullptr);
+        t.setProperty ("depth", lane.depth.load(), nullptr);
+        all.appendChild (t, nullptr);
+    }
+    state.appendChild (all, nullptr);
+}
+
+void AcidoProcessor::loadLanes (const juce::ValueTree& state)
+{
+    for (auto& lane : lanes) { lane->clear(); lane->length = acido::kSteps; lane->rate = 1; lane->smooth = false; lane->depth = 0.5f; }
+
+    const auto all = state.getChildWithName ("LANES");
+    for (const auto& t : all)
+    {
+        const int i = laneIndexFor (t.getProperty ("id").toString().toStdString());
+        if (i < 0) continue;
+        auto& lane = *lanes[(size_t) i];
+        const auto values = juce::StringArray::fromTokens (t.getProperty ("steps").toString(), ",", "");
+        for (int s = 0; s < acido::kSteps && s < values.size(); ++s)
+            lane.steps[(size_t) s] = juce::jlimit (-1.0f, 1.0f, values[s].getFloatValue());
+        lane.length = juce::jlimit (1, acido::kSteps, (int) t.getProperty ("length", acido::kSteps));
+        lane.rate   = juce::jlimit (0, 3, (int) t.getProperty ("rate", 1));
+        lane.smooth = (bool) t.getProperty ("smooth", false);
+        lane.depth  = juce::jlimit (0.0f, 1.0f, (float) t.getProperty ("depth", 0.5f));
+    }
+}
+
+// The full sound as one tree: every knob, the lanes and the preset name.
+// Used for the Live Set and for preset files alike.
+juce::ValueTree AcidoProcessor::makeState()
 {
     auto state = apvts.copyState();
-    for (int i = 0; i < numLanes; ++i)
-    {
-        juce::String p;
-        for (int s = 0; s < numSteps; ++s) p << engine.lanes[i].pattern[s].load();
-        state.setProperty ("pattern_" + juce::String (i + 1), p, nullptr);
-        juce::String c, r;
-        for (int k = 0; k < numSteps; ++k) { c << engine.lanes[i].chance[k].load(); r << engine.lanes[i].ratchet[k].load(); }
-        state.setProperty ("chance_" + juce::String (i + 1), c, nullptr);
-        state.setProperty ("ratchet_" + juce::String (i + 1), r, nullptr);
-        state.setProperty ("seed_" + juce::String (i + 1), (juce::int64) seed[i].load(), nullptr);
-    }
-    state.setProperty ("preset", currentPresetName, nullptr);
-    state.setProperty ("preset_index", currentPreset, nullptr);
+    state.removeChild (state.getChildWithName ("LANES"), nullptr);
+    saveLanes (state);
+    state.setProperty ("presetName", presets.getCurrentName(), nullptr);
+    state.setProperty ("presetIsFactory", presets.currentIsFactory(), nullptr);
+    return state;
+}
+
+bool AcidoProcessor::applyState (juce::ValueTree state)
+{
+    if (! state.hasType (apvts.state.getType())) return false;
+    loadLanes (state);
+    state.removeChild (state.getChildWithName ("LANES"), nullptr);
+    apvts.replaceState (state);
+    return true;
+}
+
+void AcidoProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    auto state = makeState();
+    state.setProperty ("uiScale", uiScale, nullptr);    // window size lives in the Live Set, not in presets
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
 
-void RaspaProcessor::setStateInformation (const void* data, int sizeInBytes)
+void AcidoProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
     {
         auto state = juce::ValueTree::fromXml (*xml);
-        if (! state.isValid()) return;
-        loadingState.store (true);
-        apvts.replaceState (state);
-        loadingState.store (false);
-        currentPresetName = state.getProperty ("preset", "Init").toString();
-        currentPreset = (int) state.getProperty ("preset_index", -1);
-        for (int i = 0; i < numLanes; ++i)
-        {
-            const auto p = state.getProperty ("pattern_" + juce::String (i + 1)).toString();
-            if (p.length() == numSteps)
-                for (int s = 0; s < numSteps; ++s)
-                    engine.lanes[i].pattern[s].store (juce::jlimit (0, 3, p[s] - '0'));
-            const auto c = state.getProperty ("chance_" + juce::String (i + 1)).toString();
-            const auto r = state.getProperty ("ratchet_" + juce::String (i + 1)).toString();
-            for (int k = 0; k < numSteps; ++k)
-            {
-                engine.lanes[i].chance[k].store (c.length() == numSteps ? juce::jlimit (0, 3, c[k] - '0') : 0);
-                engine.lanes[i].ratchet[k].store (r.length() == numSteps ? juce::jlimit (1, 4, r[k] - '0') : 1);
-            }
-            if (state.hasProperty ("seed_" + juce::String (i + 1)))
-                seed[i].store ((uint32_t) (juce::int64) state.getProperty ("seed_" + juce::String (i + 1)));
-        }
+        const auto name = state.getProperty ("presetName").toString();
+        const bool factory = (bool) state.getProperty ("presetIsFactory", false);
+        uiScale = juce::jlimit (0.6f, 1.25f, (float) state.getProperty ("uiScale", 0.75f));
+        if (applyState (state))
+            presets.restoreName (name, factory);   // shows the preset name again, unmodified
     }
 }
 
-// ------------------------------------------------------------ presets
-juce::String RaspaProcessor::noteName (int note)
+// This creates the plugin when Ableton loads it.
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    static const char* names[12] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
-    note = juce::jlimit (0, 127, note);
-    return juce::String (names[note % 12]) + juce::String (note / 12 - 2);   // Ableton naming: 36 = C1
+    return new AcidoProcessor();
 }
-
-juce::File RaspaProcessor::userPresetFolder()
-{
-    return juce::File::getSpecialLocation (juce::File::userDocumentsDirectory).getChildFile ("raspa").getChildFile ("presets");
-}
-
-int RaspaProcessor::numFactory() const { return raspa::numFactoryPresets; }
-
-juce::StringArray RaspaProcessor::getPresetNames()
-{
-    juce::StringArray names;
-    for (int i = 0; i < raspa::numFactoryPresets; ++i) names.add (raspa::factoryPresets[i].name);
-    userFiles = userPresetFolder().findChildFiles (juce::File::findFiles, false, "*.raspa");
-    userFiles.sort();
-    for (auto& f : userFiles) names.add (f.getFileNameWithoutExtension());
-    return names;
-}
-
-void RaspaProcessor::loadPreset (int index)
-{
-    auto names = getPresetNames();
-    if (index < 0 || index >= names.size()) return;
-
-    if (index >= raspa::numFactoryPresets)
-    {
-        auto file = userFiles[index - raspa::numFactoryPresets];
-        juce::MemoryBlock mb;
-        if (! file.loadFileAsData (mb)) return;
-        setStateInformation (mb.getData(), (int) mb.getSize());
-    }
-    else
-    {
-        loadingState.store (true);
-        // everything back to default (Latch, MIDI out routing and Master stay as they are)
-        for (auto* p : getParameters())
-            if (auto* rp = dynamic_cast<juce::RangedAudioParameter*> (p))
-            {
-                const auto id = rp->getParameterID();
-                if (id.startsWith ("latch") || id.startsWith ("innote") || id.startsWith ("outnote") || id.startsWith ("midiout") || id == "master") continue;
-                rp->setValueNotifyingHost (rp->getDefaultValue());
-            }
-        for (int i = 0; i < numLanes; ++i)
-        {
-            seed[i].store (1);
-            for (int k = 0; k < numSteps; ++k) { engine.lanes[i].chance[k].store (0); engine.lanes[i].ratchet[k].store (1); }
-        }
-        juce::StringArray items, stepStrings;
-        items.addTokens (raspa::factoryPresets[index].settings, " ", "");
-        for (auto& item : items)
-        {
-            auto key = item.upToFirstOccurrenceOf ("=", false, false);
-            auto value = item.fromFirstOccurrenceOf ("=", false, false).getFloatValue();
-            if (key.startsWith ("ch_") || key.startsWith ("rt_")) { stepStrings.add (item); continue; }
-            if (key.startsWith ("rng_"))
-            {
-                int lane = key.getTrailingIntValue() - 1;
-                if (lane >= 0 && lane < numLanes) seed[lane].store ((uint32_t) value);
-            }
-            else if (auto* rp = apvts.getParameter (key))
-                rp->setValueNotifyingHost (rp->convertTo0to1 (value));
-            else
-                jassertfalse;   // unknown key in a factory preset
-        }
-        loadingState.store (false);
-        for (int i = 0; i < numLanes; ++i) regenerate (i);
-        for (auto& item : stepStrings)
-            applyStepString (item.upToFirstOccurrenceOf ("=", false, false), item.fromFirstOccurrenceOf ("=", false, false));
-    }
-    currentPreset = index;
-    currentPresetName = names[index];
-}
-
-// "ch_2=0000200002000020" sets lane 2's chance per step, "rt_2=1111211111112111" its repeats
-void RaspaProcessor::applyStepString (const juce::String& key, const juce::String& digits)
-{
-    const int lane = key.getTrailingIntValue() - 1;
-    if (lane < 0 || lane >= numLanes || digits.length() != numSteps) return;
-    for (int k = 0; k < numSteps; ++k)
-    {
-        if (key.startsWith ("ch_")) engine.lanes[lane].chance[k].store (juce::jlimit (0, 3, digits[k] - '0'));
-        else engine.lanes[lane].ratchet[k].store (juce::jlimit (1, 4, digits[k] - '0'));
-    }
-}
-
-void RaspaProcessor::stepPreset (int delta)
-{
-    const int count = getPresetNames().size();
-    if (count == 0) return;
-    loadPreset (((currentPreset < 0 ? (delta > 0 ? -1 : 0) : currentPreset) + delta + count) % count);
-}
-
-bool RaspaProcessor::saveUserPreset (const juce::String& rawName)
-{
-    auto name = juce::File::createLegalFileName (rawName.trim());
-    if (name.isEmpty()) return false;
-    auto folder = userPresetFolder();
-    if (! folder.createDirectory()) return false;
-    juce::MemoryBlock mb;
-    getStateInformation (mb);
-    auto file = folder.getChildFile (name + ".raspa");
-    if (! file.replaceWithData (mb.getData(), mb.getSize())) return false;
-    auto names = getPresetNames();
-    currentPreset = names.indexOf (name);
-    currentPresetName = name;
-    return true;
-}
-
-juce::AudioProcessorEditor* RaspaProcessor::createEditor() { return new RaspaEditor (*this); }
-
-#if ! RASPA_NO_PLUGIN_ENTRY
-juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new RaspaProcessor(); }
-#endif
